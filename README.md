@@ -22,13 +22,13 @@
 
 ---
 
-### ☠️ Stability?  
+### Stability?  
 No.
 
-### 🛟 Safety?  
+### Safety?  
 Absolutely not.
 
-### 🚀 Speed?  
+### Speed?  
 **Terrifyingly yes.**
 
 ---
