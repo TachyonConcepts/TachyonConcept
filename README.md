@@ -3,6 +3,41 @@
 > A web server so fast it breaks causality... and the spec.
 
 ---
+## 🧪 Benchmark: Plaintext — or How I Learned to Stop Worrying and Love UB
+
+> *"It’s not a bug, it’s a feature. Also, it’s on fire."*
+
+| Framework              | RPS         | % of max | Comments                          |
+|------------------------|-------------|----------|-----------------------------------|
+| **tachyon-concept-ub** | 9,742,487   | 🏆 100%  | 🔥 Pure undefined behavior glory  |
+| **faf**                | 7,025,809   | 72.1%    | Tried to follow the rules… lost   |
+| **tachyon-concept**    | 6,020,793   | 61.8%    | Stable, safe, *boring*            |
+| **mrhttp**             | 5,926,138   | 60.8%    | Python?? In *this* economy?       |
+
+**`tachyon-concept-ub`** is what happens when you:
+- Ignore memory safety.
+- Abuse `unsafe`.
+- Pre-chew syscalls before the kernel even knows it needs them.
+- And write code your future self won’t recognize — because it’ll be corrupted in L1 cache.
+
+---
+
+### ☠️ Stability?  
+No.
+
+### 🛟 Safety?  
+Absolutely not.
+
+### 🚀 Speed?  
+**Terrifyingly yes.**
+
+---
+
+> Benchmarks were done using proper hardware, proper testing, and improper software.  
+> No undefined behaviors were harmed during testing. Only encouraged.
+
+> ⚠️ Running UB mode for too long may summon Eldritch compiler errors and/or open TCP connections to Cthulhu.
+---
 
 ## 🚨 Disclaimer
 
