@@ -15,11 +15,7 @@ stable-vec = "0.4"
 thread-priority = "2.1"
 memchr = "2.7"
 core_affinity = "0.8"
-
-afpacket = "0.2.3"
-ahash = "0.8"
 bytes = "1.10"
-sliceslice = "0.4.3"
 
 [profile.release]
 opt-level = 3

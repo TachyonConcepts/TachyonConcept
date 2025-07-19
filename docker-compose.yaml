@@ -1,8 +1,8 @@
 version: '3.8'
 services:
-  smallboy:
-    container_name: smallboy
-    image: smallboy_img
+  tachyon-concept:
+    container_name: tachyon-concept
+    image: tachyon_concept_img
     privileged: true
     build:
       context: ./
