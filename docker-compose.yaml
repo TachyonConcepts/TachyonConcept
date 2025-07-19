@@ -1,0 +1,12 @@
+version: '3.8'
+services:
+  smallboy:
+    container_name: smallboy
+    image: smallboy_img
+    privileged: true
+    build:
+      context: ./
+      dockerfile: ./Dockerfile
+    restart: unless-stopped
+    ports:
+      - '8080:8080'
