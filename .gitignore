@@ -11,3 +11,5 @@
 !run_ub.sh
 !rust-toolchain.toml
 !sec.json
+!.cargo
+!.cargo/**
