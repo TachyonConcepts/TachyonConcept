@@ -32,10 +32,9 @@ fn main() {
         .set_sqpoll_idle(0)
         .set_uring_size(4096)
         .set_realtime(false)
-        .set_nano_clock_asm(false)
         // .set_workers(1) // num_cpus::get() as u8 / 2
         .set_ub_kernel_dma(args().any(|arg| arg == "--ubdma"))
         .build();
-    
+
     server::run(server).unwrap();
 }

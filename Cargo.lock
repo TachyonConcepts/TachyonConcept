@@ -101,6 +101,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano_clock"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09393fa853e5f8bfbabcfd101c6f254a45ae721b3f484900c700864fb63bbfba"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "no-std-compat"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -229,6 +238,7 @@ dependencies = [
  "libc",
  "memchr",
  "mimalloc",
+ "nano_clock",
  "num_cpus",
  "socket2",
  "stable-vec",

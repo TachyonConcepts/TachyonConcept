@@ -13,7 +13,6 @@ use crate::library::{
         http::{parse_http_methods_paths, RequestEntry},
         kernel::log_kernel_error,
         memory::fast_flatten_iovec,
-        nano_clock::{nano_clock, nano_timestamp, timestamp},
         shift::shift_ub,
         trim::{l_trim256, r_trim256},
     },
@@ -32,6 +31,7 @@ use std::{
     thread,
     time::Duration,
 };
+use nano_clock::{nano_http_date, nano_timestamp, timestamp};
 use thread_priority::{ThreadBuilderExt, *};
 use tracing::{error, info, trace};
 
@@ -67,7 +67,6 @@ pub struct Server {
     sqpoll_enabled: bool,
     sqpoll_idle: u32,
     realtime: bool,
-    nano_clock_asm: bool,
     ub_kernel_dma: bool,
     // Internal
     client_fds: ExternStableVec<RawFd>,
@@ -262,26 +261,9 @@ impl Server {
             trace!("Nothing to send");
             return Ok(());
         }
-        // If we’re *not* in chaotic evil mode (UBDMA), we obey the rate limiter.
-        if !self.ub_kernel_dma {
-            let diff: i64 = self.nano_clock - self.last_sync_time;
-            let mut stopper = 0;
-            // Dynamic backpressure logic: throttle based on current RPS level.
-            // The more chaos we cause, the more the server asks us to stop.
-            if self.rps > 500_000 {
-                stopper = 20_000;
-            }
-            if self.rps > 1_000_000 {
-                stopper = 30_000;
-            }
-            if diff < stopper {
-                self.universal_counter += 1;
-                return Ok(());
-            }
-            self.last_sync_time = self.nano_clock;
-        }
+        self.last_sync_time = self.nano_clock;
         // Collect all outgoing payloads and turn them into send entries.
-        let mut entries: Vec<Entry> = Vec::with_capacity(500);
+        let mut entries: Vec<Entry> = Vec::with_capacity(100);
         for (client_id, buf_lnk) in self.client_out_buffers.iter_mut() {
             if buf_lnk.len() == 0 {
                 continue;
@@ -300,7 +282,7 @@ impl Server {
                         UserData {
                             client_id: client_id as u32,
                             buffer_id: 0,
-                            uniq_id: 0xCCC as u16,
+                            uniq_id: 0xCCCu16,
                         }
                         .pack_user_data(),
                         fd,
@@ -688,7 +670,7 @@ impl Server {
                 self.synced = self.clock;
                 // Format timestamp, broadcast our existence
                 let mut date: [u8; 35] = [0; 35];
-                nano_clock(&mut date, true);
+                nano_http_date(&mut date, false);
                 self.date = date;
                 let conns = self.client_fds.iter().len() - 100; // forgive the arbitrary 100, it knows what it did
                 info!(
@@ -781,7 +763,6 @@ impl Server {
             sqpoll_idle: DEFAULT_SQPOLL_IDLE,
             sqpoll_enabled: false,
             realtime: false,
-            nano_clock_asm: false,
             ub_kernel_dma: false,
             client_fds: ExternStableVec::new(),
             iovec_success: unsafe { [zeroed(), zeroed(), zeroed()] },
@@ -807,19 +788,10 @@ impl Server {
             _mac: String::default(),
             _pci: String::default(),
         };
-        unsafe { nano_clock(&mut server.date, false) };
+        unsafe { nano_http_date(&mut server.date, false) };
         server.iovec_success = server.build_iovec(head_success, &server.date, tail_success);
         server.iovec_not_found = server.build_iovec(head_not_found, &server.date, tail_not_found);
         server
-    }
-    #[inline(always)]
-    pub fn get_nano_clock_asm(&self) -> bool {
-        self.nano_clock_asm
-    }
-    #[inline(always)]
-    pub fn set_nano_clock_asm(&mut self, asm: bool) -> &mut Self {
-        self.nano_clock_asm = asm;
-        self
     }
     #[inline(always)]
     pub fn get_sqpoll_idle(&self) -> u32 {
