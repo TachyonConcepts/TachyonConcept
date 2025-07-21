@@ -1,10 +1,6 @@
-use socket2::{Domain, Protocol, SockAddr, Socket, Type};
-use std::{
-    io,
-    net::TcpListener
-    ,
-};
 use crate::library::uring::Uring;
+use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+use std::{io, net::TcpListener};
 
 pub const BUF_GROUP: u16 = 42;
 pub const REQ_RESP_OFFSET: u64 = u64::MAX / 2;
@@ -51,7 +47,13 @@ pub trait ServerInternal {
         Ok(listener.into())
     }
 
-    fn build_uring(&self, size: u32, sqpoll_idle: u32, affinity: u32, use_sqpoll: bool) -> io::Result<Uring> {
+    fn build_uring(
+        &self,
+        size: u32,
+        sqpoll_idle: u32,
+        affinity: u32,
+        use_sqpoll: bool,
+    ) -> io::Result<Uring> {
         Uring::new(size, sqpoll_idle, affinity, use_sqpoll)
     }
 }

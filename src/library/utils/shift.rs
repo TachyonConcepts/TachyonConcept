@@ -1,5 +1,5 @@
-use std::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
 use crate::library::server::BUFFER_SIZE;
+use std::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
 
 #[inline(always)]
 pub unsafe fn shift_safe(buf: &mut [u8], len: usize) {

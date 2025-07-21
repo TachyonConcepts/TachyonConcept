@@ -178,6 +178,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a0d197bd2c9dc6e53b84da9556a69ba4cdfab8619eb41a8bd1cc2027a0f6b1d"
 
 [[package]]
+name = "ryu"
+version = "1.0.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28d3b2b1366ec20994f1fd18c3c594f05c5dd4bc44d8bb0c1c632c8d6829481f"
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -242,9 +248,19 @@ dependencies = [
  "num_cpus",
  "socket2",
  "stable-vec",
+ "tachyon_json",
  "thread-priority",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "tachyon_json"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd31c283c2c3740a0bb2c3e74a761d347db220a39376aa8957147b6d2ae8c7dc"
+dependencies = [
+ "ryu",
 ]
 
 [[package]]

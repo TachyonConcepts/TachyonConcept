@@ -1,9 +1,9 @@
 use crate::library::{
     server::BUFFER_SIZE,
-    server_internals::{BUFFER_REGISTER_CODE, BUF_GROUP, CODE_ACCEPT},
+    server_internals::{BUF_GROUP, BUFFER_REGISTER_CODE, CODE_ACCEPT},
 };
 use io_uring::{opcode, squeue, squeue::Flags, types};
-use libc::{msghdr, MSG_DONTWAIT, SOCK_NONBLOCK};
+use libc::{MSG_DONTWAIT, SOCK_NONBLOCK, msghdr};
 use std::os::fd::RawFd;
 use tracing::trace;
 

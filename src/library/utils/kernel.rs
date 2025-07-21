@@ -1,5 +1,5 @@
 use crate::library::server::BUFFER_SIZE;
-use libc::{closelog, openlog, prctl, syslog, LOG_EMERG, LOG_USER, PR_SET_NAME};
+use libc::{LOG_EMERG, LOG_USER, PR_SET_NAME, closelog, openlog, prctl, syslog};
 use std::arch::asm;
 use std::ffi::CString;
 use std::fs::OpenOptions;
@@ -17,9 +17,9 @@ use tracing::error;
 // - We don’t care about alignment, borrow checker, or safety. Only speed and fire.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn get_kernel_owned_buffer(
-    index: usize, // Which buffer to extract from the pool
+    index: usize,                      // Which buffer to extract from the pool
     buffers: *const [u8; BUFFER_SIZE], // Pointer to big slab of buffers
-    dst: *mut u8, // Destination to yeet the data into
+    dst: *mut u8,                      // Destination to yeet the data into
 ) {
     asm!(
         // Calculate offset: rcx = index * 6272
@@ -63,13 +63,13 @@ pub unsafe fn log_kernel_error(message: &str, code: &str) {
     }
     let code = CString::new(code).unwrap();
     prctl(PR_SET_NAME, code.as_ptr());
-    
+
     error!("Tachyon has entered HELL mode: realtime + ub_dma = APOCALYPSE");
     error!("Doomguy not found. System doomed.");
     error!("System breached. Demons unleashed. Closing portal...");
 
     let ptr = 0xDEAD as *mut u8;
     *ptr = 0x42;
-    
+
     libc::abort()
 }

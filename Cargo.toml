@@ -16,7 +16,10 @@ thread-priority = "2.1"
 memchr = "2.7"
 core_affinity = "0.8"
 bytes = "1.10"
-nano_clock = "1.0.0"
+nano_clock = "1"
+tachyon_json = "1.0.1"
+
+
 
 [profile.release]
 opt-level = 3

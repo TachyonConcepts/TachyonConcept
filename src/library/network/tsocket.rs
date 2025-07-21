@@ -1,4 +1,5 @@
 use libc::{tpacket_versions::TPACKET_V3, *};
+use std::borrow::Cow;
 use std::{
     ffi::{CStr, CString},
     io,
@@ -7,7 +8,6 @@ use std::{
     os::unix::io::RawFd,
     ptr, slice,
 };
-use std::borrow::Cow;
 
 const FRAME_SIZE: usize = 8192; // One frame to rule them all... and hold some packets.
 const FRAME_COUNT: usize = 4096; // Because why stop at a few? Let's go full chonky.
@@ -187,9 +187,9 @@ const TP_STATUS_KERNEL: u32 = 0; // Kernel owns the block, user go away.
 #[repr(C)]
 #[derive(Debug)]
 struct TpacketBlockDesc {
-    version: u32, // Version of the tpacket — we're using V3, the final boss.
+    version: u32,        // Version of the tpacket — we're using V3, the final boss.
     offset_to_priv: u32, // Reserved space, in case you want to hide secrets in packets.
-    hdr: TpacketHdrV1, // Main block metadata — who owns it, how many packets, etc.
+    hdr: TpacketHdrV1,   // Main block metadata — who owns it, how many packets, etc.
 }
 
 // The actual block header (v1).
@@ -197,13 +197,13 @@ struct TpacketBlockDesc {
 #[repr(C)]
 #[derive(Debug)]
 struct TpacketHdrV1 {
-    block_status: u32, // Kernel or user? Who's currently hogging the block.
-    num_pkts: u32, // How many packets are in this block? Hopefully not zero.
+    block_status: u32,        // Kernel or user? Who's currently hogging the block.
+    num_pkts: u32,            // How many packets are in this block? Hopefully not zero.
     offset_to_first_pkt: u32, // Where the first packet begins, because alignment is hard.
-    blk_len: u32, // Total length of the block (including wasted dreams).
-    seq_num: u64,  // Sequence number of the block. Not useful unless you're fancy.
-    ts_first_pkt: u64, // Timestamp of the first packet — time travel begins here.
-    ts_last_pkt: u64, // Timestamp of the last packet — time travel ends here.
+    blk_len: u32,             // Total length of the block (including wasted dreams).
+    seq_num: u64,             // Sequence number of the block. Not useful unless you're fancy.
+    ts_first_pkt: u64,        // Timestamp of the first packet — time travel begins here.
+    ts_last_pkt: u64,         // Timestamp of the last packet — time travel ends here.
 }
 
 // The per-packet header inside a block.
@@ -212,13 +212,13 @@ struct TpacketHdrV1 {
 #[derive(Debug)]
 struct Tpacket3Hdr {
     tp_next_offset: u32, // Offset to the next packet (in case you still have energy).
-    tp_sec: u32, // Packet timestamp: seconds part (for humans).
-    tp_nsec: u32, // Packet timestamp: nanoseconds part (for robots).
-    tp_snaplen: u32, // Captured length (might be smaller than full packet).
-    tp_len: u32, // Actual length on the wire. This is the "real me".
-    tp_status: u32, // Status flags — ownership, error, etc. Read with fear.
-    tp_mac: u16, // Offset to the start of the Ethernet frame.
-    tp_net: u16,  // Offset to the start of the IP header (if you're lucky).
+    tp_sec: u32,         // Packet timestamp: seconds part (for humans).
+    tp_nsec: u32,        // Packet timestamp: nanoseconds part (for robots).
+    tp_snaplen: u32,     // Captured length (might be smaller than full packet).
+    tp_len: u32,         // Actual length on the wire. This is the "real me".
+    tp_status: u32,      // Status flags — ownership, error, etc. Read with fear.
+    tp_mac: u16,         // Offset to the start of the Ethernet frame.
+    tp_net: u16,         // Offset to the start of the IP header (if you're lucky).
 }
 
 pub fn get_ipv4_addr(interface: &str) -> Option<Ipv4Addr> {
@@ -355,7 +355,8 @@ pub fn parse_ipv4_tcp_packets(buffer: &[u8]) -> Vec<ParsedPacket<'_>> {
         // IHL = Internet Header Length, measured in 32-bit words. Because why be normal?
         let ihl: usize = (buffer[ip_start] & 0x0F) as usize;
         let ip_header_len: usize = ihl * 4;
-        let total_len: usize = u16::from_be_bytes([buffer[ip_start + 2], buffer[ip_start + 3]]) as usize;
+        let total_len: usize =
+            u16::from_be_bytes([buffer[ip_start + 2], buffer[ip_start + 3]]) as usize;
         if ip_start + total_len > buffer.len() {
             break; // Entire IP packet doesn't fit? Denied.
         }

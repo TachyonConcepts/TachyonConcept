@@ -1,6 +1,6 @@
 use std::{
     arch::x86_64::{__m256i, _mm256_setzero_si256, _mm256_storeu_si256},
-    ptr
+    ptr,
 };
 
 // Flattens a slice of iovecs into a single `&mut [u8]`.
@@ -39,7 +39,6 @@ pub unsafe fn flatten_iovec(iovecs: &[libc::iovec], out: &mut Vec<u8>) {
         }
     }
 }
-
 
 // Purpose: Obliterate a buffer using 256-bit AVX2 stores like a memory-purging demon.
 // It's like memset, but instead of C heritage, it brings raw unaligned SIMD firepower.

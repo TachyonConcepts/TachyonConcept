@@ -1,9 +1,8 @@
+use libc::{O_NONBLOCK, fcntl, socklen_t};
 use std::os::fd::RawFd;
-use libc::{fcntl, socklen_t, O_NONBLOCK};
 use tracing::trace;
 
-pub unsafe fn prepare_incoming_socket(client_fd: RawFd)
-{
+pub unsafe fn prepare_incoming_socket(client_fd: RawFd) {
     // Give the socket a 1MB send buffer — because bigger is always better (probably).
     let sndbuf_size: i32 = 1 * 1024 * 1024;
     libc::setsockopt(

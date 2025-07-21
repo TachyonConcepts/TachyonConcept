@@ -1,8 +1,8 @@
 use memchr::memchr;
 use memchr::memmem::Finder;
 use std::arch::x86_64::{
-    __m256i, _blsr_u32, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
-    _mm256_set1_epi8, _mm_prefetch, _tzcnt_u32, _MM_HINT_NTA,
+    __m256i, _MM_HINT_NTA, _blsr_u32, _mm_prefetch, _mm256_cmpeq_epi8, _mm256_loadu_si256,
+    _mm256_movemask_epi8, _mm256_set1_epi8, _tzcnt_u32,
 };
 // Welcome to the hot path. This function lives in a tight loop and eats CPU for breakfast.
 // Touch it, and the benchmark gods will smite you.
@@ -111,7 +111,8 @@ pub unsafe fn unreliable_parse_http_methods_paths<const N: usize>(
                             let limit = hdr_len.min(64);
                             // Scan for METHOD SP PATH SP ...
                             let chunk = _mm256_loadu_si256(hdr_ptr as *const __m256i);
-                            let space_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_sp)) as u32;
+                            let space_mask =
+                                _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_sp)) as u32;
 
                             let s1 = _tzcnt_u32(space_mask) as usize;
                             let s2 = _tzcnt_u32(_blsr_u32(space_mask)) as usize;

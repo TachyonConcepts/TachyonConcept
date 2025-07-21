@@ -7,7 +7,14 @@ use tracing::info;
 // I didn’t write this, I just had the good sense to copy it.
 
 #[inline(always)]
-pub fn sys_call5(mut num: isize, arg1: isize, arg2: isize, arg3: isize, arg4: isize, arg5: isize) -> isize {
+pub fn sys_call5(
+    mut num: isize,
+    arg1: isize,
+    arg2: isize,
+    arg3: isize,
+    arg4: isize,
+    arg5: isize,
+) -> isize {
     // Direct system call — because libc is for cowards.
     unsafe {
         asm!(
@@ -72,20 +79,37 @@ pub fn attach_reuseport_cbpf(fd: isize) {
 
     // This filter says: "Load the current CPU ID, then return it as the hash bucket"
     let mut code: [SockFilter; 2] = [
-        SockFilter { code: BPF_LD | BPF_W | BPF_ABS, jt: 0, jf: 0, k: (SKF_AD_OFF + SKF_AD_CPU) as u32 },
-        SockFilter { code: BPF_RET | BPF_A, jt: 0, jf: 0, k: 0 },
+        SockFilter {
+            code: BPF_LD | BPF_W | BPF_ABS,
+            jt: 0,
+            jf: 0,
+            k: (SKF_AD_OFF + SKF_AD_CPU) as u32,
+        },
+        SockFilter {
+            code: BPF_RET | BPF_A,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
     ];
 
-    let prog = SockFprog { len: code.len() as u16, filter: code.as_mut_ptr() };
+    let prog = SockFprog {
+        len: code.len() as u16,
+        filter: code.as_mut_ptr(),
+    };
     // Raw syscall time. No wrappers. No safety nets. Just steel and fire.
     let ret = sys_call5(
-      SYS_SETSOCKOPT as isize,
-      fd,
-      SOL_SOCKET as isize,
-      SO_ATTACH_REUSEPORT_CBPF as isize,
-      &prog as *const _ as _,
-      size_of::<SockFprog>() as isize
-   );
+        SYS_SETSOCKOPT as isize,
+        fd,
+        SOL_SOCKET as isize,
+        SO_ATTACH_REUSEPORT_CBPF as isize,
+        &prog as *const _ as _,
+        size_of::<SockFprog>() as isize,
+    );
     // This prints either "it worked" or "you summoned kernel demons"
-    info!("SO_ATTACH_REUSEPORT_CBPF ret: {}, size = {}", ret, size_of::<SockFprog>() as isize);
+    info!(
+        "SO_ATTACH_REUSEPORT_CBPF ret: {}, size = {}",
+        ret,
+        size_of::<SockFprog>() as isize
+    );
 }

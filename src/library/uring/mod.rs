@@ -1,6 +1,6 @@
 pub mod kernel_cmds;
 
-use io_uring::{cqueue, squeue, Builder, IoUring}; // The magic portal to kernel-space IO wizardry.
+use io_uring::{Builder, IoUring, cqueue, squeue}; // The magic portal to kernel-space IO wizardry.
 use std::io;
 use tracing::info;
 
@@ -10,9 +10,9 @@ pub struct Uring {
 
 impl Uring {
     pub fn new(
-        size: u32, // Depth of the ring buffer. How much pain you can queue.
+        size: u32,            // Depth of the ring buffer. How much pain you can queue.
         sqpoll_idle: u32, // How long the SQ thread should wait (in milliseconds) before chilling out.
-        affinity: u32, // CPU core to pin the SQPOLL thread to. Because cache locality is king.
+        affinity: u32,    // CPU core to pin the SQPOLL thread to. Because cache locality is king.
         sqpoll_enabled: bool, // Whether to unleash the SQPOLL daemon.
     ) -> io::Result<Uring> {
         let mut builder: Builder = IoUring::builder();

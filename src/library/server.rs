@@ -21,6 +21,7 @@ use bytes::{Bytes, BytesMut};
 use core_affinity::CoreId;
 use io_uring::{cqueue, squeue::Entry, CompletionQueue, SubmissionQueue, Submitter};
 use libc::{setsockopt, ENOBUFS, IPPROTO_IP, IP_TOS};
+use nano_clock::{nano_http_date, nano_timestamp, timestamp};
 use stable_vec::ExternStableVec;
 use std::{
     collections::VecDeque,
@@ -31,9 +32,10 @@ use std::{
     thread,
     time::Duration,
 };
-use nano_clock::{nano_http_date, nano_timestamp, timestamp};
+use tachyon_json::TachyonBuffer;
 use thread_priority::{ThreadBuilderExt, *};
 use tracing::{error, info, trace};
+use crate::library::utils::tachyon_data_lake::TachyonDataLake;
 
 pub(crate) const BUFFER_SIZE: usize = 7168; // 6272
 const BUFFERS_COUNT: usize = 1024;
@@ -72,7 +74,11 @@ pub struct Server {
     client_fds: ExternStableVec<RawFd>,
     iovec_success: [libc::iovec; 3],
     iovec_not_found: [libc::iovec; 3],
-    date: [u8; 35],
+
+    pub(crate) date: [u8; 35],
+    hot_json_buf: TachyonBuffer<100>,
+    hot_data_lake: TachyonDataLake<230>,
+
     sync_now: bool,
     pointers: VecDeque<Bytes>,
     buffers: [[u8; BUFFER_SIZE]; BUFFERS_COUNT],
@@ -401,6 +407,7 @@ impl Server {
             let request: &RequestEntry = requests.0.get(index).unwrap();
             let method: &[u8] = r_trim256(l_trim256(request.0));
             let path: &[u8] = r_trim256(l_trim256(request.1));
+
             // If you scream "GET /plaintext", you get the good stuff.
             let len: usize = if method == b"GET" && path == b"/plaintext" {
                 fast_flatten_iovec(
@@ -459,19 +466,16 @@ impl Server {
         for index in 0..requests.1 {
             self._rps += 1;
             let request: &RequestEntry = requests.0.get(index).unwrap();
-            let len: usize = if request.0 == b"GET" && request.1 == b"/plaintext" {
-                // They said the magic words.
-                fast_flatten_iovec(
-                    &self.iovec_success,
-                    &mut self.hot_internal_cache[total_len..],
-                )
-            } else {
-                // Heresy. Punish with 404.
-                fast_flatten_iovec(
-                    &self.iovec_not_found,
-                    &mut self.hot_internal_cache[total_len..],
-                )
-            };
+
+            let len: usize = Self::handler(
+                request.0,
+                request.1,
+                &self.date,
+                &mut self.hot_internal_cache[total_len..],
+                &mut self.hot_json_buf,
+                &mut self.hot_data_lake
+            );
+            // println!("{}", String::from_utf8_lossy(&self.hot_internal_cache));
             total_len += len;
         }
         // Fire the prepared response payload into the client's output buffer.
@@ -768,6 +772,8 @@ impl Server {
             iovec_success: unsafe { [zeroed(), zeroed(), zeroed()] },
             iovec_not_found: unsafe { [zeroed(), zeroed(), zeroed()] },
             date: [0u8; 35],
+            hot_json_buf: TachyonBuffer::<100>::default(),
+            hot_data_lake: TachyonDataLake::<230>::build(),
             sync_now: true,
             pointers: VecDeque::new(),
             buffers: [[0u8; BUFFER_SIZE]; BUFFERS_COUNT],
@@ -843,7 +849,14 @@ impl Server {
         self.ub_kernel_dma = enabled;
         self
     }
-
+    // #[inline(always)]
+    // pub fn set_handler(
+    //     &mut self,
+    //     handler: for<'a> fn(&'a [u8], &'a [u8]) -> &'a[u8],
+    // ) -> &mut Self {
+    //     self.handler = handler;
+    //     self
+    // }
     #[inline(always)]
     pub fn build(&mut self) -> Self {
         self.clone()
