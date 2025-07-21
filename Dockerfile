@@ -6,4 +6,4 @@ COPY . .
 RUN RUSTFLAGS="-C target-cpu=native" cargo install --path .
 RUN cargo clean
 EXPOSE 8080
-CMD /app/run.sh
+CMD /app/run_ub.sh

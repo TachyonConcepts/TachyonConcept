@@ -405,22 +405,15 @@ impl Server {
         for index in 0..requests.1 {
             self._rps += 1;
             let request: &RequestEntry = requests.0.get(index).unwrap();
-            let method: &[u8] = r_trim256(l_trim256(request.0));
-            let path: &[u8] = r_trim256(l_trim256(request.1));
-
-            // If you scream "GET /plaintext", you get the good stuff.
-            let len: usize = if method == b"GET" && path == b"/plaintext" {
-                fast_flatten_iovec(
-                    &self.iovec_success,
-                    &mut self.hot_internal_cache[total_len..],
-                )
-            } else {
-                // Otherwise, into the 404 dungeon you go.
-                fast_flatten_iovec(
-                    &self.iovec_not_found,
-                    &mut self.hot_internal_cache[total_len..],
-                )
-            };
+            let len: usize = Self::handler(
+                request.0,
+                request.1,
+                &self.date,
+                &mut self.hot_internal_cache[total_len..],
+                &mut self.hot_json_buf,
+                &mut self.hot_data_lake
+            );
+            // println!("{}", String::from_utf8_lossy(&self.hot_internal_cache));
             total_len += len;
         }
         // Time to smuggle our forged response back to the client’s output buffer.
