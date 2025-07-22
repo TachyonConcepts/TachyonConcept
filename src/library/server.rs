@@ -10,14 +10,14 @@ use crate::library::{
     },
     utils::{
         faf_helpers::attach_reuseport_cbpf,
+        http::unreliable_parse_http_methods_paths,
         http::{parse_http_methods_paths, RequestEntry},
         kernel::log_kernel_error,
-        memory::fast_flatten_iovec,
-        shift::shift_ub,
-        trim::{l_trim256, r_trim256},
+        shift::shift_ub_inplace,
+        tachyon_data_lake::TachyonDataLake,
+        trim::l_trim256,
     },
 };
-use bytes::{Bytes, BytesMut};
 use core_affinity::CoreId;
 use io_uring::{cqueue, squeue::Entry, CompletionQueue, SubmissionQueue, Submitter};
 use libc::{setsockopt, ENOBUFS, IPPROTO_IP, IP_TOS};
@@ -26,40 +26,37 @@ use stable_vec::ExternStableVec;
 use std::{
     collections::VecDeque,
     io,
-    mem::zeroed,
     net::TcpListener,
     os::fd::{AsRawFd, RawFd},
     thread,
-    time::Duration,
 };
+use std::time::Duration;
 use tachyon_json::TachyonBuffer;
 use thread_priority::{ThreadBuilderExt, *};
 use tracing::{error, info, trace};
-use crate::library::utils::tachyon_data_lake::TachyonDataLake;
 
-pub(crate) const BUFFER_SIZE: usize = 7168; // 6272
+pub(crate) const BUFFER_SIZE: usize = 7168; // 6272 7168
 const BUFFERS_COUNT: usize = 1024;
 const DEFAULT_URING_SIZE: u32 = 4096;
 const DEFAULT_ACCEPT_MULTIPLICATOR: u8 = 16;
 const DEFAULT_SQPOLL_IDLE: u32 = 5000;
-const RESPONSE_SUCCESS: &[u8; 204] = b"HTTP/1.1 200 OK\r\n\
------------------------------------\r\n\
-Server: Tachyon\r\n\
-Content-Type: text/plain; charset=utf-8\r\n\
-Content-Length: 13\r\n\
-Connection: keep-alive\r\n\
-Keep-Alive: timeout=5, max=1000\r\n\
-\r\n\
-Hello, World!";
-const RESPONSE_NOT_FOUND: &[u8; 206] = b"HTTP/1.1 404 Not Found\r\n\
------------------------------------\r\n\
-Server: Tachyon\r\n\
-Content-Type: text/plain; charset=utf-8\r\n\
-Content-Length: 9\r\n\
-Connection: keep-alive\r\n\
-Keep-Alive: timeout=5, max=1000\r\n\
-\r\n\
-Not found";
+const DATA_LAKE_SIZE: usize = BUFFER_SIZE * 2; // 4100
+
+#[derive(Copy, Clone)]
+pub struct Ptr<T>(*const T);
+
+impl<T> Ptr<T> {
+    pub fn new(ptr: *const T) -> Self {
+        Self(ptr)
+    }
+    pub fn get(&self) -> *const T {
+        self.0
+    }
+    pub unsafe fn as_ref<'a>(&self) -> &'a T {
+        &*self.0
+    }
+}
+
 #[derive(Clone)]
 pub struct Server {
     // Public config
@@ -72,18 +69,16 @@ pub struct Server {
     ub_kernel_dma: bool,
     // Internal
     client_fds: ExternStableVec<RawFd>,
-    iovec_success: [libc::iovec; 3],
-    iovec_not_found: [libc::iovec; 3],
 
     pub(crate) date: [u8; 35],
     hot_json_buf: TachyonBuffer<100>,
     hot_data_lake: TachyonDataLake<230>,
 
     sync_now: bool,
-    pointers: VecDeque<Bytes>,
+    pointers: VecDeque<Ptr<TachyonDataLake<DATA_LAKE_SIZE>>>,
     buffers: [[u8; BUFFER_SIZE]; BUFFERS_COUNT],
     released_buffers: Vec<u16>,
-    client_out_buffers: ExternStableVec<BytesMut>,
+    client_out_buffers: ExternStableVec<TachyonDataLake<DATA_LAKE_SIZE>>,
     client_kernel_buffer_id: ExternStableVec<u16>,
     hot_internal_cache: [u8; BUFFER_SIZE],
     universal_counter: usize,
@@ -215,7 +210,7 @@ impl Server {
         let client_fd_id = self.client_fds.push(client_fd);
         // Allocate a per-client outgoing buffer. We don’t write yet, but it’s good to be ready.
         self.client_out_buffers
-            .insert(client_fd_id, BytesMut::new());
+            .insert(client_fd_id, TachyonDataLake::<DATA_LAKE_SIZE>::build());
         trace!("Receive new accept on FD:{client_fd}. Connection ID: {client_fd_id}");
         // If UBDMA is enabled — we go turbo mode.
         // Instead of waiting for recv to finish, we slap a poll here and later just read the buffer directly.
@@ -260,6 +255,25 @@ impl Server {
             trace!("Truncate pointers");
             self.pointers.truncate_front(20_000);
         }
+
+        if !self.ub_kernel_dma {
+            let diff: i64 = self.nano_clock - self.last_sync_time;
+            let mut stopper = 0;
+            // Dynamic backpressure logic: throttle based on current RPS level.
+            // The more chaos we cause, the more the server asks us to stop.
+            if self.rps > 500_000 {
+                stopper = 1_000;
+            }
+            if self.rps > 1_000_000 {
+                stopper = 2_000;
+            }
+            if diff < stopper {
+                self.universal_counter += 1;
+                return Ok(());
+            }
+            self.last_sync_time = self.nano_clock;
+        }
+
         trace!("Call wideband send");
         // Are we sending data to anyone, or just talking to ourselves again?
         let used_out_buffers_len = self.client_out_buffers.iter().len();
@@ -270,19 +284,19 @@ impl Server {
         self.last_sync_time = self.nano_clock;
         // Collect all outgoing payloads and turn them into send entries.
         let mut entries: Vec<Entry> = Vec::with_capacity(100);
-        for (client_id, buf_lnk) in self.client_out_buffers.iter_mut() {
-            if buf_lnk.len() == 0 {
+        for (client_id, data_lake) in self.client_out_buffers.iter_mut() {
+            if data_lake.len() == 0 {
                 continue;
             }
-            // Take the message out of the buffer and freeze it like it’s going to Siberia.
-            let frozen: Bytes = std::mem::take(buf_lnk).freeze();
+            let lake_ptr: *const TachyonDataLake<DATA_LAKE_SIZE> = data_lake.freeze_ptr();
             // Do we still know this client? Or did it rage-quit the universe?
             match self.client_fds.get(client_id) {
                 Some(fd) => {
                     let fd: RawFd = *fd;
                     // Store the frozen packet to keep it alive during send.
-                    self.pointers.push_back(frozen);
-                    let new_ptr: &Bytes = self.pointers.back().unwrap();
+                    self.pointers.push_back(Ptr::new(lake_ptr));
+                    let new_ptr: &Ptr<TachyonDataLake<DATA_LAKE_SIZE>> =
+                        self.pointers.back().unwrap();
                     // Build the sacred send entry.
                     let send_entry: Entry = send(
                         UserData {
@@ -292,7 +306,7 @@ impl Server {
                         }
                         .pack_user_data(),
                         fd,
-                        new_ptr,
+                        new_ptr.as_ref().as_slice(),
                         false,
                     );
                     entries.push(send_entry);
@@ -302,9 +316,10 @@ impl Server {
                     continue;
                 }
             };
+            data_lake.reset_pos();
         }
         if entries.len() > 0 {
-            sq.push_multiple(entries.as_slice()).unwrap();
+            sq.push_multiple(&entries).unwrap();
             self.io_send_busy = true;
         }
         // Mark the system as dirty — we’ll need to flush again soon.
@@ -358,7 +373,7 @@ impl Server {
     unsafe fn ubdma(&mut self, client: UserData) -> io::Result<()> {
         trace!("Enter EB-DMA");
         // We begin our descent into madness. First, identify the chosen victim.
-        let cid = client.client_id as usize;
+        let cid: usize = client.client_id as usize;
         // Retrieve the sacred kernel buffer ID. If it doesn’t exist, the ritual cannot proceed.
         let kernel_buffer: Option<&u16> = self.client_kernel_buffer_id.get(cid);
         if kernel_buffer.is_none() {
@@ -369,7 +384,8 @@ impl Server {
         let kernel_buffer_id: usize = *kernel_buffer.unwrap() as usize;
         let buffer: &[u8] = &self.buffers[kernel_buffer_id][..];
         // Try to make sense of the data inside while it’s still twitching. Extract HTTP requests.
-        let requests: ([RequestEntry; 32], usize) = parse_http_methods_paths(&buffer);
+        let buffer: &[u8] = l_trim256(buffer);
+        let requests: ([RequestEntry; 50], usize) = unreliable_parse_http_methods_paths(&buffer);
         // Hypothetically useful FDs (e.g. if we needed to set priority for latecomers).
         let useful: Vec<RawFd> = Vec::with_capacity(requests.1.saturating_sub(5) * 128);
         // If we’re not busy, boost the client's priority — might be real traffic!
@@ -389,13 +405,15 @@ impl Server {
             return Ok(());
         }
         // Just in case the client ran off before we could send the punchline.
-        let cbstate: Option<&BytesMut> = self.client_out_buffers.get(cid);
+        let cbstate: Option<&mut TachyonDataLake<DATA_LAKE_SIZE>> =
+            self.client_out_buffers.get_mut(cid);
         if cbstate.is_none() {
             error!("Client buffer not found. Client disconnected?");
             return Ok(());
         }
         // If there's already data pending — someone else beat us to the chaos.
-        if cbstate.unwrap().len() != 0 {
+        let client_buffer: &mut TachyonDataLake<DATA_LAKE_SIZE> = cbstate.unwrap();
+        if client_buffer.len() != 0 {
             trace!("Some request already processed. Skip.");
             return Ok(());
         }
@@ -411,21 +429,16 @@ impl Server {
                 &self.date,
                 &mut self.hot_internal_cache[total_len..],
                 &mut self.hot_json_buf,
-                &mut self.hot_data_lake
+                &mut self.hot_data_lake,
             );
             // println!("{}", String::from_utf8_lossy(&self.hot_internal_cache));
             total_len += len;
         }
-        // Time to smuggle our forged response back to the client’s output buffer.
-        let client_buffer: Option<&mut BytesMut> = self.client_out_buffers.get_mut(cid);
-        if client_buffer.is_none() {
-            trace!("No client buffer found for client {}", cid);
-            return Ok(());
-        }
         // And now... PUSH! Like the buffer owes us money.
-        let client_buffer: &mut BytesMut = client_buffer.unwrap();
-        client_buffer.extend_from_slice(&self.hot_internal_cache[..total_len]);
+        let hot_slice = &self.hot_internal_cache[..total_len];
+        client_buffer.write(hot_slice.as_ptr(), hot_slice.len());
         // We notify the outer loop that things have happened. Dark things.
+
         self.sync_now = true;
         Ok(())
     }
@@ -453,27 +466,28 @@ impl Server {
         let buffer: &[u8] = &self.buffers[buf_id as usize][..result as usize];
         trace!("New message incoming. Len: {}", buffer.len());
         // Attempt to extract structured requests from the raw chaos.
-        let requests: ([RequestEntry; 32], usize) = parse_http_methods_paths(buffer);
+        let requests: ([RequestEntry; 50], usize) = parse_http_methods_paths(buffer);
         // Begin preparing a response. Fast-path for success and not-so-fast for "not found".
         let mut total_len: usize = 0;
         for index in 0..requests.1 {
             self._rps += 1;
             let request: &RequestEntry = requests.0.get(index).unwrap();
-
             let len: usize = Self::handler(
                 request.0,
                 request.1,
                 &self.date,
                 &mut self.hot_internal_cache[total_len..],
                 &mut self.hot_json_buf,
-                &mut self.hot_data_lake
+                &mut self.hot_data_lake,
             );
             // println!("{}", String::from_utf8_lossy(&self.hot_internal_cache));
             total_len += len;
         }
         // Fire the prepared response payload into the client's output buffer.
-        let client_buffer: &mut BytesMut = self.client_out_buffers.get_unchecked_mut(cid);
-        client_buffer.extend_from_slice(&self.hot_internal_cache[..total_len]);
+        let hot_slice: &[u8] = &self.hot_internal_cache[..total_len];
+        let client_buffer: &mut TachyonDataLake<DATA_LAKE_SIZE> =
+            self.client_out_buffers.get_unchecked_mut(cid);
+        client_buffer.write(hot_slice.as_ptr(), hot_slice.len());
         // Flag for sync: this shall be pushed soon.
         self.sync_now = true;
         // Return buffer to "available" list. Just not yet — batching is everything.
@@ -481,10 +495,9 @@ impl Server {
         // And now, the cursed part:
         if self.ub_kernel_dma {
             // Check the byte at the tail of the buffer. If it’s 0, assume "safe to shift".
-            if *&self.buffers[buf_id as usize][BUFFER_SIZE - 1].clone() == 0u8 {
-                let res: [u8; BUFFER_SIZE] =
-                    shift_ub(&mut self.buffers[buf_id as usize], result as usize);
-                self.buffers[buf_id as usize] = res;
+            let buf: &mut [u8; BUFFER_SIZE] = &mut self.buffers[buf_id as usize];
+            if buf[BUFFER_SIZE - 1] == 0 {
+                shift_ub_inplace(buf, result as usize);
             }
         }
         // If we’ve hoarded enough buffers, release the Kraken.
@@ -722,38 +735,8 @@ impl Server {
 }
 // Public server endpoints
 impl Server {
-    pub(super) fn rebuild_iovecs(&mut self) {
-        info!("IOVECs rebuild success. Direct memory access is active.");
-        self.iovec_success[1].iov_base = self.date.as_ptr() as _;
-        self.iovec_not_found[1].iov_base = self.date.as_ptr() as _;
-    }
-    pub(super) fn build_iovec<'a>(
-        &self,
-        head: &'a [u8],
-        date: &'a [u8],
-        tail: &'a [u8],
-    ) -> [libc::iovec; 3] {
-        [
-            libc::iovec {
-                iov_base: head.as_ptr() as _,
-                iov_len: head.len(),
-            },
-            libc::iovec {
-                iov_base: date.as_ptr() as _,
-                iov_len: date.len(),
-            },
-            libc::iovec {
-                iov_base: tail.as_ptr() as _,
-                iov_len: tail.len(),
-            },
-        ]
-    }
     pub fn new(addr: &'static str) -> Server {
-        let (head_success, tail_success) = (&RESPONSE_SUCCESS[..17], &RESPONSE_SUCCESS[23 + 29..]);
-        let (head_not_found, tail_not_found) =
-            (&RESPONSE_NOT_FOUND[..24], &RESPONSE_NOT_FOUND[30 + 29..]);
-
-        let mut server = Server {
+        Server {
             addr,
             workers: num_cpus::get().max(1) as u8,
             uring_size: DEFAULT_URING_SIZE,
@@ -762,8 +745,6 @@ impl Server {
             realtime: false,
             ub_kernel_dma: false,
             client_fds: ExternStableVec::new(),
-            iovec_success: unsafe { [zeroed(), zeroed(), zeroed()] },
-            iovec_not_found: unsafe { [zeroed(), zeroed(), zeroed()] },
             date: [0u8; 35],
             hot_json_buf: TachyonBuffer::<100>::default(),
             hot_data_lake: TachyonDataLake::<230>::build(),
@@ -786,11 +767,7 @@ impl Server {
             _hz: 0,
             _mac: String::default(),
             _pci: String::default(),
-        };
-        unsafe { nano_http_date(&mut server.date, false) };
-        server.iovec_success = server.build_iovec(head_success, &server.date, tail_success);
-        server.iovec_not_found = server.build_iovec(head_not_found, &server.date, tail_not_found);
-        server
+        }
     }
     #[inline(always)]
     pub fn get_sqpoll_idle(&self) -> u32 {
@@ -842,14 +819,6 @@ impl Server {
         self.ub_kernel_dma = enabled;
         self
     }
-    // #[inline(always)]
-    // pub fn set_handler(
-    //     &mut self,
-    //     handler: for<'a> fn(&'a [u8], &'a [u8]) -> &'a[u8],
-    // ) -> &mut Self {
-    //     self.handler = handler;
-    //     self
-    // }
     #[inline(always)]
     pub fn build(&mut self) -> Self {
         self.clone()
@@ -876,7 +845,7 @@ pub fn run(server: Server) -> io::Result<()> {
         let server = server.clone(); // yes, cloning entire server per-thread
         thread::Builder::new()
             .name(format!("Tachyon-{}", thread)) // Tachyon — fast, radioactive, and very real
-            .stack_size(BUFFER_SIZE * BUFFERS_COUNT * 4) // big boy stack for big boy packets
+            .stack_size(BUFFER_SIZE * BUFFERS_COUNT * 10) // big boy stack for big boy packets
             .spawn_with_priority(ThreadPriority::Max, move |_| unsafe {
                 let res = core_affinity::set_for_current(core_ids[thread as usize]);
                 if !res {
@@ -893,7 +862,6 @@ pub fn run(server: Server) -> io::Result<()> {
                     let mut instance: Server = server.clone();
                     info!("Creating base listener");
                     let listener: TcpListener = instance.build_listener(instance.addr).unwrap();
-                    instance.rebuild_iovecs(); // rebuilds iovecs from pre-flattened vectors
                     if let Err(e) = instance.sq_poll(listener, server.sqpoll_idle, thread as u32) {
                         error!("worker error: {e}");
                     }

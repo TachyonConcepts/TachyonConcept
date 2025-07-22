@@ -13,7 +13,7 @@ use library::{
     utils::tachyon_data_lake::{TachyonDataLake, TachyonDataLakeTools},
 };
 use std::env::args;
-use tachyon_json::{tachyon_object_noescape, TachyonBuffer, TachyonValue};
+use tachyon_json::{tachyon_object_noescape, TachyonBuffer};
 use tracing_subscriber::fmt;
 
 fn bootstrap_logs() {
@@ -32,7 +32,6 @@ const STATUS_SUCCESS: &[u8] = b"HTTP/1.1 200 OK\r\n";
 const STATUS_NOT_FOUND: &[u8] = b"HTTP/1.1 404 Not Found\r\n";
 const CONTENT_TYPE_TEXT: &[u8] = b"Content-Type: text/plain; charset=utf-8\r\n";
 const CONTENT_TYPE_JSON: &[u8] = b"Content-Type: application/json; charset=utf-8\r\n";
-
 const BASE_HEADERS: &[u8] = b"Server: Tachyon\r\n\
 Connection: keep-alive\r\n\
 Keep-Alive: timeout=5, max=1000\r\n\
@@ -47,23 +46,21 @@ impl Server {
         json_buf: &mut TachyonBuffer<100>,
         data_lake: &mut TachyonDataLake<230>,
     ) -> usize {
+        // Clean old json entries
         json_buf.reset_pos();
+        // Clean old requests
         data_lake.reset_pos();
-
         let (status_line, ct, body): (&[u8], &[u8], &[u8]);
-
+        // Router
         if method == b"GET" && path == b"/plaintext" {
             (status_line, ct, body) = (STATUS_SUCCESS, CONTENT_TYPE_TEXT, b"Hello, World!");
         } else if method == b"GET" && path == b"/json" {
-            let msg: TachyonValue = tachyon_object_noescape! {
-                "message" => "Hello, World!",
-            };
-            msg.encode(json_buf, true);
+            tachyon_object_noescape! {"message" => "Hello, World!"}.encode(json_buf, true);
             (status_line, ct, body) = (STATUS_SUCCESS, CONTENT_TYPE_JSON, json_buf.as_slice())
         } else {
             (status_line, ct, body) = (STATUS_NOT_FOUND, CONTENT_TYPE_TEXT, b"Not, found!")
         };
-
+        // Build tachyon data lake
         data_lake.write(status_line.as_ptr(), status_line.len());
         data_lake.write(ct.as_ptr(), ct.len());
         data_lake.write(date.as_ptr(), date.len());

@@ -1,7 +1,6 @@
 use std::arch::x86_64::{
     __m128i, __m256i, _mm256_loadu_si256, _mm256_storeu_si256, _mm_loadu_si128, _mm_storeu_si128,
 };
-use std::ops::Add;
 
 pub struct TachyonDataLakeTools;
 
@@ -45,8 +44,8 @@ impl TachyonDataLakeTools {
     }
 }
 
-#[derive(Clone)]
 #[repr(C)]
+#[derive(Clone)]
 pub struct TachyonDataLake<const N: usize> {
     pub(super) buf: [u8; N],
     pub(super) pos: usize,
@@ -68,6 +67,18 @@ impl<const N: usize> TachyonDataLake<N> {
     pub unsafe fn write_byte(&mut self, c: u8) {
         *self.buf.as_mut_ptr().add(self.pos) = c;
         self.pos += 1;
+        // Ring behavior
+        if self.pos >= self.buf.len() {
+            self.pos = 0;
+        }
+    }
+    #[inline(always)]
+    pub fn freeze_ref(&mut self) -> &Self {
+        &*self
+    }
+    #[inline(always)]
+    pub fn freeze_ptr(&self) -> *const Self {
+        self as *const Self
     }
     #[inline(always)]
     pub unsafe fn as_slice(&self) -> &[u8] {
@@ -85,8 +96,18 @@ impl<const N: usize> TachyonDataLake<N> {
     pub unsafe fn as_mut_ptr(&mut self) -> *mut u8 {
         self.buf.as_mut_ptr().add(self.pos)
     }
+    #[inline(always)]
     pub unsafe fn write(&mut self, src: *const u8, len: usize) {
-        let dst = self.buf.as_mut_ptr().add(self.pos);
+        let buf_len: usize = self.buf.len();
+        if len > buf_len {
+            panic!("DataLake overflow: trying to write {len}, but buffer is only {buf_len}");
+        }
+        let dst: *mut u8 = if len <= (buf_len - self.pos) {
+            self.buf.as_mut_ptr().add(self.pos)
+        } else {
+            self.pos = 0;
+            self.buf.as_mut_ptr()
+        };
         TachyonDataLakeTools::write_to(dst, src, len);
         self.pos += len;
     }
@@ -120,6 +141,7 @@ impl<const N: usize> TachyonDataLake<N> {
 
         self.pos += len;
     }
+    #[allow(dead_code)]
     #[inline(always)]
     fn into_raw_parts(mut self) -> (*mut u8, usize) {
         let ptr = self.buf.as_mut_ptr();
@@ -128,5 +150,3 @@ impl<const N: usize> TachyonDataLake<N> {
         (ptr, len)
     }
 }
-
-

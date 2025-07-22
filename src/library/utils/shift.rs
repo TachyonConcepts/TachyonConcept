@@ -37,3 +37,10 @@ pub unsafe fn shift_ub(buf: &mut [u8], len: usize) -> [u8; BUFFER_SIZE] {
     // Return the relic to the calling realm
     dst_vec
 }
+
+#[inline(always)]
+pub fn shift_ub_inplace(buf: &mut [u8], len: usize) {
+    let dst_offset = buf.len().saturating_sub(len);
+    buf.copy_within(0..len, dst_offset);
+    buf[..dst_offset].fill(0);
+}
