@@ -11,4 +11,4 @@ sysctl -w net.ipv4.tcp_fin_timeout=10
 
 ulimit -n 65535
 ulimit -s unlimited
-tachyon
+tachyon --ubdma
