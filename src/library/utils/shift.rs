@@ -14,7 +14,7 @@ pub unsafe fn shift_safe(buf: &mut [u8], len: usize) {
     }
 }
 
-#[inline(always)]
+#[target_feature(enable = "avx2")]
 pub unsafe fn shift_ub(buf: &mut [u8], len: usize) -> [u8; BUFFER_SIZE] {
     // Vectorized arcane dance: lift the front, drop it at the end.
     // AVX2 priests bless this operation.

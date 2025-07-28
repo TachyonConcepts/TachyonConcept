@@ -58,6 +58,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "lake"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d97031109203500aff7116ab8654f552d04a989c731d948cc828af21d23dbc86"
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -241,6 +247,7 @@ dependencies = [
  "bytes",
  "core_affinity",
  "io-uring",
+ "lake",
  "libc",
  "memchr",
  "mimalloc",

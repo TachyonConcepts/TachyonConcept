@@ -8,10 +8,9 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 pub mod library;
-use library::{
-    server::{self, Server},
-    utils::tachyon_data_lake::{TachyonDataLake, TachyonDataLakeTools},
-};
+use crate::library::server;
+use lake::{lake::memory::LakeTools, small_lake::SmallLake};
+use library::server::Server;
 use std::env::args;
 use tachyon_json::{tachyon_object_noescape, TachyonBuffer};
 use tracing_subscriber::fmt;
@@ -44,7 +43,7 @@ impl Server {
         date: &[u8; 35],
         hot_cache: &mut [u8],
         json_buf: &mut TachyonBuffer<100>,
-        data_lake: &mut TachyonDataLake<230>,
+        data_lake: &mut SmallLake<512>,
     ) -> usize {
         // Clean old json entries
         json_buf.reset_pos();
@@ -70,7 +69,7 @@ impl Server {
         data_lake.write(b"\r\n".as_ptr(), 2);
         data_lake.write(BASE_HEADERS.as_ptr(), BASE_HEADERS.len());
         data_lake.write(body.as_ptr(), body.len());
-        TachyonDataLakeTools::write_to(hot_cache.as_mut_ptr(), data_lake.as_ptr(), data_lake.len());
+        LakeTools::write_to(hot_cache.as_mut_ptr(), data_lake.as_ptr(), data_lake.len());
         data_lake.len()
     }
 }

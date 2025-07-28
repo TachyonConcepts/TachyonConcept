@@ -1,142 +1,198 @@
-use memchr::memchr;
-use memchr::memmem::Finder;
 use std::arch::x86_64::{
-    __m256i, _MM_HINT_NTA, _blsr_u32, _mm_prefetch, _mm256_cmpeq_epi8, _mm256_loadu_si256,
-    _mm256_movemask_epi8, _mm256_set1_epi8, _tzcnt_u32,
+    __m256i, _mm256_and_si256, _mm256_cmpeq_epi8,
+    _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
 };
 // Welcome to the hot path. This function lives in a tight loop and eats CPU for breakfast.
 // Touch it, and the benchmark gods will smite you.
 //
-// Current benchmark: ~435ns per iteration with ~40 HTTP pipelined requests.
+// Current benchmark: ~10ns per request.
 // Not bad. Not great. But very much "hold my beer".
 
 pub type RequestEntry<'a> = (&'a [u8], &'a [u8]); // (method, path). Everything else is lies.
 
-#[inline(always)]
-pub fn parse_http_methods_paths<const N: usize>(buf: &[u8]) -> ([RequestEntry<'_>; N], usize) {
-    let mut out: [RequestEntry; N] = [(&[][..], &[][..]); N];
-    let mut n = 0;
-    // Fast searcher for "\r\n\r\n" — the HTTP handshake of "I'm done talking".
-    let finder = Finder::new(b"\r\n\r\n");
-    let mut start = 0;
-    // Loop through pipelined HTTP requests, like a well-oiled assembly line.
-    // We stop at N, because infinite loops are only fun for the kernel.
-    for end in finder.find_iter(buf).take(N) {
-        let header = &buf[start..end]; // The sacred scroll: full HTTP header block
-        start = end + 4; // Skip past "\r\n\r\n" like a real adult
-        // Find the first and second spaces in the request line.
-        // We're looking for "METHOD SP PATH SP ..." — not "poetry SP in SP motion".
-        if let Some(sp1) = memchr(b' ', header) {
-            // Yes, this offset dance is safe and elegant.
-            // It’s also one of the reasons we don’t let interns write hot-path code.
-            if let Some(sp2) = memchr(b' ', &header[sp1 + 1..]) {
-                out[n] = (
-                    &header[..sp1],                  // METHOD (e.g., "GET", "POST", "DELETE", "BREW")
-                    &header[sp1 + 1..sp1 + 1 + sp2], // PATH (e.g., "/plaintext")
-                );
-                n += 1;
-            }
+#[target_feature(enable = "avx2")]
+pub unsafe fn parse_one_manual(ptr: *const u8) -> Option<((usize, u8), (usize, u8), usize)> {
+    let first8: u64 = *(ptr as *const u64);
+    const GET_MASK: u64 = u64::from_le_bytes(*b"GET \0\0\0\0");
+    const POST_MASK: u64 = u64::from_le_bytes(*b"POST \0\0\0");
+    if first8 & 0xFFFFFFFF == GET_MASK {
+        let method_len: u8 = 3;
+        let path_start: usize = 4;
+        let chunk: __m256i = _mm256_loadu_si256(ptr as *const __m256i);
+        let space: __m256i = _mm256_set1_epi8(b' ' as i8);
+        let cmp: __m256i = _mm256_cmpeq_epi8(chunk, space);
+        let mask: u32 = _mm256_movemask_epi8(cmp) as u32;
+        let mask2: u32 = mask >> path_start;
+        if mask2 == 0 {
+            return None;
         }
+        let path_len: u8 = mask2.trailing_zeros() as u8;
+        return Some(((0, method_len), (path_start, path_len), 0));
     }
-    // Return what we found. Ignore the rest. Like a good hacker at a bad party.
-    (out, n)
+    if first8 & 0xFFFFFFFFFF == POST_MASK {
+        let method_len: u8 = 4;
+        let path_start: usize = 5;
+        let chunk: __m256i = _mm256_loadu_si256(ptr as *const __m256i);
+        let space: __m256i = _mm256_set1_epi8(b' ' as i8);
+        let cmp: __m256i = _mm256_cmpeq_epi8(chunk, space);
+        let mask: u32 = _mm256_movemask_epi8(cmp) as u32;
+        let mask2: u32 = mask >> path_start;
+        if mask2 == 0 {
+            return None;
+        }
+        let path_len: u8 = mask2.trailing_zeros() as u8;
+        return Some(((0, method_len), (path_start, path_len), 0));
+    }
+    let chunk: __m256i = _mm256_loadu_si256(ptr as *const __m256i);
+    let space: __m256i = _mm256_set1_epi8(b' ' as i8);
+    let cmp: __m256i = _mm256_cmpeq_epi8(chunk, space);
+    let mask: u32 = _mm256_movemask_epi8(cmp) as u32;
+    if mask == 0 {
+        return None;
+    }
+    let method_len: u8 = mask.trailing_zeros() as u8;
+    let path_start: usize = method_len as usize + 1;
+    let mask2: u32 = mask >> path_start;
+    if mask2 == 0 {
+        return None;
+    }
+    let path_len: u8 = mask2.trailing_zeros() as u8;
+    Some(((0, method_len), (path_start, path_len), 0))
 }
 
-/// This is the *unsafe, unhinged, and unapologetically fast* version.
-///
-/// It doesn't parse HTTP — it **rips** `(METHOD, PATH)` out of pipelined requests
-/// using AVX2, raw pointers, and zero regard for correctness in edge cases.
-///
-/// Assumptions (read: comforting lies we tell ourselves):
-/// - Input is valid ASCII-only HTTP.
-/// - Every request ends with `\r\n\r\n`. Always. No exceptions. Trust me, bro.
-/// - No chunked encoding. No meaningful headers. No tears.
-/// - METHOD and PATH are space-separated. Everything after that is dead to us.
-///
-/// Do not use this in production unless your idea of fun includes:
-/// - Memory safety bugs
-/// - Invalid HTTP causing very real business consequences
-/// - Explaining AVX2 stack traces to your boss at 2 AM
-///
-/// Use with caution. Or better yet: don't use it.
-/// Benchmark it, brag about it, and quietly walk away.
+#[target_feature(enable = "avx2")]
+pub unsafe fn find_request_starts_avx2<const N: usize>(buf: &[u8]) -> ([usize; N], usize) {
+    let mut found: [usize; N] = [0usize; N];
+    let mut count: usize = 0;
+    let len: usize = buf.len();
+    let mut i: usize = 0;
+    while i + 66 <= len && count < N {
+        let ptr: *const u8 = buf.as_ptr();
+        let c0a: __m256i = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
+        let c1a: __m256i = _mm256_loadu_si256(ptr.add(i + 1) as *const __m256i);
+        let c2a: __m256i = _mm256_loadu_si256(ptr.add(i + 2) as *const __m256i);
+
+        let get_mask_a: u32 = _mm256_movemask_epi8(_mm256_and_si256(
+            _mm256_cmpeq_epi8(c0a, _mm256_set1_epi8(b'G' as i8)),
+            _mm256_and_si256(
+                _mm256_cmpeq_epi8(c1a, _mm256_set1_epi8(b'E' as i8)),
+                _mm256_cmpeq_epi8(c2a, _mm256_set1_epi8(b'T' as i8)),
+            ),
+        )) as u32;
+        let post_mask_a: u32 = _mm256_movemask_epi8(_mm256_and_si256(
+            _mm256_cmpeq_epi8(c0a, _mm256_set1_epi8(b'P' as i8)),
+            _mm256_and_si256(
+                _mm256_cmpeq_epi8(c1a, _mm256_set1_epi8(b'O' as i8)),
+                _mm256_cmpeq_epi8(c2a, _mm256_set1_epi8(b'S' as i8)),
+            ),
+        )) as u32;
+        let c0b: __m256i = _mm256_loadu_si256(ptr.add(i + 32) as *const __m256i);
+        let c1b: __m256i = _mm256_loadu_si256(ptr.add(i + 33) as *const __m256i);
+        let c2b: __m256i = _mm256_loadu_si256(ptr.add(i + 34) as *const __m256i);
+        let get_mask_b: u32 = _mm256_movemask_epi8(_mm256_and_si256(
+            _mm256_cmpeq_epi8(c0b, _mm256_set1_epi8(b'G' as i8)),
+            _mm256_and_si256(
+                _mm256_cmpeq_epi8(c1b, _mm256_set1_epi8(b'E' as i8)),
+                _mm256_cmpeq_epi8(c2b, _mm256_set1_epi8(b'T' as i8)),
+            ),
+        )) as u32;
+        let post_mask_b: u32 = _mm256_movemask_epi8(_mm256_and_si256(
+            _mm256_cmpeq_epi8(c0b, _mm256_set1_epi8(b'P' as i8)),
+            _mm256_and_si256(
+                _mm256_cmpeq_epi8(c1b, _mm256_set1_epi8(b'O' as i8)),
+                _mm256_cmpeq_epi8(c2b, _mm256_set1_epi8(b'S' as i8)),
+            ),
+        )) as u32;
+        let mask_a: u32 = get_mask_a | post_mask_a;
+        let mask_b: u32 = get_mask_b | post_mask_b;
+        if mask_a != 0 {
+            let mut bits: u32 = mask_a;
+            while bits != 0 && count < N {
+                let tz: usize = bits.trailing_zeros() as usize;
+                found[count] = i + tz;
+                count += 1;
+                bits &= bits - 1;
+            }
+        }
+        if mask_b != 0 {
+            let mut bits: u32 = mask_b;
+            while bits != 0 && count < N {
+                let tz: usize = bits.trailing_zeros() as usize;
+                found[count] = i + 32 + tz;
+                count += 1;
+                bits &= bits - 1;
+            }
+        }
+        i += 64;
+    }
+    while i + 34 <= len && count < N {
+        let p0: *const __m256i = buf.as_ptr().add(i) as *const __m256i;
+        let p1: *const __m256i = buf.as_ptr().add(i + 1) as *const __m256i;
+        let p2: *const __m256i = buf.as_ptr().add(i + 2) as *const __m256i;
+
+        let chunk0: __m256i = _mm256_loadu_si256(p0);
+        let chunk1: __m256i = _mm256_loadu_si256(p1);
+        let chunk2: __m256i = _mm256_loadu_si256(p2);
+        let get_mask: u32 = _mm256_movemask_epi8(_mm256_and_si256(
+            _mm256_cmpeq_epi8(chunk0, _mm256_set1_epi8(b'G' as i8)),
+            _mm256_and_si256(
+                _mm256_cmpeq_epi8(chunk1, _mm256_set1_epi8(b'E' as i8)),
+                _mm256_cmpeq_epi8(chunk2, _mm256_set1_epi8(b'T' as i8)),
+            ),
+        )) as u32;
+        let post_mask: u32 = _mm256_movemask_epi8(_mm256_and_si256(
+            _mm256_cmpeq_epi8(chunk0, _mm256_set1_epi8(b'P' as i8)),
+            _mm256_and_si256(
+                _mm256_cmpeq_epi8(chunk1, _mm256_set1_epi8(b'O' as i8)),
+                _mm256_cmpeq_epi8(chunk2, _mm256_set1_epi8(b'S' as i8)),
+            ),
+        )) as u32;
+        let mask: u32 = get_mask | post_mask;
+        if mask != 0 {
+            let mut bits: u32 = mask;
+            while bits != 0 && count < N {
+                let tz: usize = bits.trailing_zeros() as usize;
+                found[count] = i + tz;
+                count += 1;
+                bits &= bits - 1;
+            }
+        }
+        i += 32;
+    }
+    (found, count)
+}
+#[derive(Copy, Clone, Default, Debug)]
+pub struct RequestRawEntry {
+    pub method_start: usize,
+    pub method_len: u8,
+    pub path_start: usize,
+    pub path_len: u8,
+}
 
 #[inline(always)]
-pub unsafe fn unreliable_parse_http_methods_paths<const N: usize>(
-    buf: &[u8],
-) -> ([RequestEntry<'_>; N], usize) {
-    // Output array for (method, path) pairs – totally unreliable, just blazing fast.
-    let mut out: [RequestEntry<'_>; N] = [(&[][..], &[][..]); N];
-    let ptr = buf.as_ptr();
-    let len = buf.len();
+pub unsafe fn parse_http_methods_paths<'a, const N: usize>(
+    buf: &'a [u8],
+) -> ([RequestEntry<'a>; N], usize) {
+    let mut out: [RequestEntry<'a>; N] = [(&[][..], &[][..]); N];
+    let mut count: usize = 0;
+    let (starts, total): ([usize; N], usize) = find_request_starts_avx2::<N>(buf);
 
-    let mut i = 0usize; // Input cursor
-    let mut n = 0usize; // Parsed request count
-    let mut start = 0usize; // Start of the current request header
-
-    // AVX2 constants for finding '\n' and ' '
-    let v_lf = _mm256_set1_epi8(b'\n' as i8); // Line feed
-    let v_sp = _mm256_set1_epi8(b' ' as i8); // Space
-
-    // After weeks of pain, trial, profiling, and existential crisis,
-    // this overlap‑sliding window of 192 bytes, shifted by 128, gave the best tradeoff:
-    // ~80–114 ns per pass with up to 15/20 requests captured. Acceptable losses. We sleep now.
-    while i + 192 <= len && n < N {
-        // Load 3x 64-byte chunks with overlap for better double-CRLF detection
-        let chunk1 = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
-        let chunk2 = _mm256_loadu_si256(ptr.add(i + 64) as *const __m256i);
-        let chunk3 = _mm256_loadu_si256(ptr.add(i + 128) as *const __m256i);
-        // A nod to the gods of cache
-        _mm_prefetch(ptr.add(i + 256) as *const i8, _MM_HINT_NTA); // Prefetch next window
-        // Create bitmasks for LF positions in each chunk
-        let mut mask1 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk1, v_lf)) as u32;
-        let mut mask2 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk2, v_lf)) as u32;
-        let mut mask3 = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk3, v_lf)) as u32;
-        // Macro to process each LF mask – we look for "\r\n\r\n" ending the header,
-        // then extract METHOD and PATH up to 64 bytes max using space positions.
-        macro_rules! process_mask {
-            ($mask:ident, $offset:expr) => {
-                while $mask != 0 && n < N {
-                    let tz = $mask.trailing_zeros() as usize;
-                    let pos = i + $offset + tz;
-                    $mask = _blsr_u32($mask); // Clear the lowest bit (next match)
-
-                    if pos >= 3 && pos + 1 < len {
-                        // Check if bytes before this LF form the magic "\r\n\r\n" sequence
-                        let word = *(ptr.add(pos - 3) as *const u32);
-                        if word == 0x0a0d0a0d {
-                            // This is the end of the HTTP header
-                            let hdr_ptr = ptr.add(start);
-                            let hdr_len = pos - 1 - start;
-                            let limit = hdr_len.min(64);
-                            // Scan for METHOD SP PATH SP ...
-                            let chunk = _mm256_loadu_si256(hdr_ptr as *const __m256i);
-                            let space_mask =
-                                _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_sp)) as u32;
-
-                            let s1 = _tzcnt_u32(space_mask) as usize;
-                            let s2 = _tzcnt_u32(_blsr_u32(space_mask)) as usize;
-                            // Make sure we don’t create nonsense slices
-                            if s1 < limit && s2 < limit && s1 + 1 < s2 {
-                                out[n] = (
-                                    core::slice::from_raw_parts(hdr_ptr, s1),
-                                    core::slice::from_raw_parts(hdr_ptr.add(s1 + 1), s2 - s1 - 1),
-                                );
-                                n += 1;
-                            }
-                            // Move start pointer to just after "\r\n\r\n"
-                            start = pos + 1;
-                        }
-                    }
-                }
-            };
+    for i in 0..total {
+        let start: usize = starts[i];
+        if start + 32 > buf.len() {
+            break;
         }
-        // Process all 3 masks – this block alone defeated multiple AVX2 optimizations and overlap schemes
-        process_mask!(mask1, 0);
-        process_mask!(mask2, 64);
-        process_mask!(mask3, 128);
-        i += 128; // Overlap by 64 bytes – we tried 64/96/128/192 steps. This won.
+        let raw: *const u8 = buf.as_ptr().add(start);
+        if let Some(((m_off, m_len), (p_off, p_len), _adv)) = parse_one_manual(raw) {
+            let m_ptr = buf.as_ptr().add(start + m_off);
+            let p_ptr = buf.as_ptr().add(start + p_off);
+            out[count] = (
+                core::slice::from_raw_parts(m_ptr, m_len as usize),
+                core::slice::from_raw_parts(p_ptr, p_len as usize),
+            );
+            count += 1;
+        }
     }
-    // Output the partially reliable results
-    (out, n)
+
+    (out, count)
 }

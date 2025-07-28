@@ -10,21 +10,20 @@ use crate::library::{
     },
     utils::{
         faf_helpers::attach_reuseport_cbpf,
-        http::unreliable_parse_http_methods_paths,
         http::{parse_http_methods_paths, RequestEntry},
         kernel::log_kernel_error,
         shift::shift_ub_inplace,
-        tachyon_data_lake::TachyonDataLake,
         trim::l_trim256,
     },
 };
 use core_affinity::CoreId;
 use io_uring::{cqueue, squeue::Entry, CompletionQueue, SubmissionQueue, Submitter};
-use libc::{setsockopt, ENOBUFS, IPPROTO_IP, IP_TOS};
+use lake::small_lake::SmallLake;
+use libc::ENOBUFS;
 use nano_clock::{nano_http_date, nano_timestamp, timestamp};
 use stable_vec::ExternStableVec;
 use std::{
-    collections::VecDeque,
+    cell::Cell,
     io,
     net::TcpListener,
     os::fd::{AsRawFd, RawFd},
@@ -40,21 +39,10 @@ const BUFFERS_COUNT: usize = 1024;
 const DEFAULT_URING_SIZE: u32 = 4096;
 const DEFAULT_ACCEPT_MULTIPLICATOR: u8 = 16;
 const DEFAULT_SQPOLL_IDLE: u32 = 5000;
-const DATA_LAKE_SIZE: usize = BUFFER_SIZE * 2; // 4100
+const DATA_LAKE_SIZE: usize = BUFFER_SIZE * 3; // 4100
 
-#[derive(Copy, Clone)]
-pub struct Ptr<T>(*const T);
-
-impl<T> Ptr<T> {
-    pub fn new(ptr: *const T) -> Self {
-        Self(ptr)
-    }
-    pub fn get(&self) -> *const T {
-        self.0
-    }
-    pub unsafe fn as_ref<'a>(&self) -> &'a T {
-        &*self.0
-    }
+thread_local! {
+    static CURRENT_KERNEL_BUF: Cell<*const u8> = Cell::<*const u8>::new(std::ptr::null());
 }
 
 #[derive(Clone)]
@@ -72,15 +60,13 @@ pub struct Server {
 
     pub(crate) date: [u8; 35],
     hot_json_buf: TachyonBuffer<100>,
-    hot_data_lake: TachyonDataLake<230>,
+    hot_data_lake: SmallLake<512>, // 230
 
     sync_now: bool,
-    pointers: VecDeque<Ptr<TachyonDataLake<DATA_LAKE_SIZE>>>,
     buffers: [[u8; BUFFER_SIZE]; BUFFERS_COUNT],
     released_buffers: Vec<u16>,
-    client_out_buffers: ExternStableVec<TachyonDataLake<DATA_LAKE_SIZE>>,
-    client_kernel_buffer_id: ExternStableVec<u16>,
-    hot_internal_cache: [u8; BUFFER_SIZE],
+    client_out_buffers: ExternStableVec<SmallLake<DATA_LAKE_SIZE>>,
+    hot_internal_cache: [u8; BUFFER_SIZE * 2],
     universal_counter: usize,
     io_send_busy: bool,
     // Internal clock
@@ -210,7 +196,7 @@ impl Server {
         let client_fd_id = self.client_fds.push(client_fd);
         // Allocate a per-client outgoing buffer. We don’t write yet, but it’s good to be ready.
         self.client_out_buffers
-            .insert(client_fd_id, TachyonDataLake::<DATA_LAKE_SIZE>::build());
+            .insert(client_fd_id, SmallLake::<DATA_LAKE_SIZE>::build());
         trace!("Receive new accept on FD:{client_fd}. Connection ID: {client_fd_id}");
         // If UBDMA is enabled — we go turbo mode.
         // Instead of waiting for recv to finish, we slap a poll here and later just read the buffer directly.
@@ -242,38 +228,7 @@ impl Server {
     /// This function handles outgoing data like a postal worker on five shots of espresso.
     /// It loops through every client with something to say and throws their packets at the kernel
     /// as fast as it dares — or until the RPS gods say “chill”.
-    ///
-    /// In UBDMA mode, all throttling logic is ignored because safety is for people who write Java.
-    ///
-    /// Notes:
-    /// - We store frozen buffers in a `pointers` deque to avoid lifetime issues.
-    /// - If that deque becomes too long, we truncate it like a corrupt politician’s résumé.
-    /// - We try to avoid overloading the kernel unless we’re told otherwise (via UBDMA).
     unsafe fn wideband_send(&mut self, sq: &mut SubmissionQueue) -> io::Result<()> {
-        // We're hoarding old responses like dragons hoard gold — time to burn some.
-        if self.pointers.len() >= 100_000 {
-            trace!("Truncate pointers");
-            self.pointers.truncate_front(20_000);
-        }
-
-        if !self.ub_kernel_dma {
-            let diff: i64 = self.nano_clock - self.last_sync_time;
-            let mut stopper = 0;
-            // Dynamic backpressure logic: throttle based on current RPS level.
-            // The more chaos we cause, the more the server asks us to stop.
-            if self.rps > 500_000 {
-                stopper = 1_000;
-            }
-            if self.rps > 1_000_000 {
-                stopper = 2_000;
-            }
-            if diff < stopper {
-                self.universal_counter += 1;
-                return Ok(());
-            }
-            self.last_sync_time = self.nano_clock;
-        }
-
         trace!("Call wideband send");
         // Are we sending data to anyone, or just talking to ourselves again?
         let used_out_buffers_len = self.client_out_buffers.iter().len();
@@ -288,15 +243,10 @@ impl Server {
             if data_lake.len() == 0 {
                 continue;
             }
-            let lake_ptr: *const TachyonDataLake<DATA_LAKE_SIZE> = data_lake.freeze_ptr();
             // Do we still know this client? Or did it rage-quit the universe?
             match self.client_fds.get(client_id) {
                 Some(fd) => {
                     let fd: RawFd = *fd;
-                    // Store the frozen packet to keep it alive during send.
-                    self.pointers.push_back(Ptr::new(lake_ptr));
-                    let new_ptr: &Ptr<TachyonDataLake<DATA_LAKE_SIZE>> =
-                        self.pointers.back().unwrap();
                     // Build the sacred send entry.
                     let send_entry: Entry = send(
                         UserData {
@@ -306,7 +256,7 @@ impl Server {
                         }
                         .pack_user_data(),
                         fd,
-                        new_ptr.as_ref().as_slice(),
+                        &data_lake.buf[..data_lake.pos],
                         false,
                     );
                     entries.push(send_entry);
@@ -374,45 +324,56 @@ impl Server {
         trace!("Enter EB-DMA");
         // We begin our descent into madness. First, identify the chosen victim.
         let cid: usize = client.client_id as usize;
-        // Retrieve the sacred kernel buffer ID. If it doesn’t exist, the ritual cannot proceed.
-        let kernel_buffer: Option<&u16> = self.client_kernel_buffer_id.get(cid);
-        if kernel_buffer.is_none() {
-            trace!("No kernel buffer found for client {}", cid);
+
+        let buffer: Option<&[u8]> = std::panic::catch_unwind(|| {
+            CURRENT_KERNEL_BUF.with(|cell| {
+                let ptr = cell.get();
+                if ptr.is_null() {
+                    None
+                } else {
+                    Some(unsafe { std::slice::from_raw_parts(ptr, BUFFER_SIZE) })
+                }
+            })
+        })
+        .ok()
+        .flatten();
+
+        if buffer.is_none() {
+            trace!(
+                "Skipping request: kernel buffer is unavailable (thread exit or not initialized)"
+            );
             return Ok(());
         }
-        // Lock in on the buffer. This is the forbidden fruit we shall bite *while the kernel is still peeling it*.
-        let kernel_buffer_id: usize = *kernel_buffer.unwrap() as usize;
-        let buffer: &[u8] = &self.buffers[kernel_buffer_id][..];
+        let buffer = buffer.unwrap();
         // Try to make sense of the data inside while it’s still twitching. Extract HTTP requests.
         let buffer: &[u8] = l_trim256(buffer);
-        let requests: ([RequestEntry; 50], usize) = unreliable_parse_http_methods_paths(&buffer);
+        let requests: ([RequestEntry; 50], usize) = parse_http_methods_paths(&buffer);
         // Hypothetically useful FDs (e.g. if we needed to set priority for latecomers).
-        let useful: Vec<RawFd> = Vec::with_capacity(requests.1.saturating_sub(5) * 128);
+        let useful: Vec<RawFd> = Vec::with_capacity(requests.1.saturating_sub(5) * DATA_LAKE_SIZE);
         // If we’re not busy, boost the client's priority — might be real traffic!
         if useful.capacity() == 0 {
             trace!("Incr priority for {}", client.client_id);
-            let tos: libc::c_int = 0xB8;
             let cfid: Option<&RawFd> = self.client_fds.get(cid);
             if cfid.is_some() {
-                setsockopt(
-                    cfid.unwrap().as_raw_fd(),
-                    IPPROTO_IP,
-                    IP_TOS,
-                    &tos as *const _ as *const _,
-                    size_of_val(&tos) as _,
-                );
+                // let tos: libc::c_int = 0xB8;
+                // setsockopt(
+                //     cfid.unwrap().as_raw_fd(),
+                //     IPPROTO_IP,
+                //     IP_TOS,
+                //     &tos as *const _ as *const _,
+                //     size_of_val(&tos) as _,
+                // );
             }
             return Ok(());
         }
         // Just in case the client ran off before we could send the punchline.
-        let cbstate: Option<&mut TachyonDataLake<DATA_LAKE_SIZE>> =
-            self.client_out_buffers.get_mut(cid);
+        let cbstate: Option<&mut SmallLake<DATA_LAKE_SIZE>> = self.client_out_buffers.get_mut(cid);
         if cbstate.is_none() {
             error!("Client buffer not found. Client disconnected?");
             return Ok(());
         }
         // If there's already data pending — someone else beat us to the chaos.
-        let client_buffer: &mut TachyonDataLake<DATA_LAKE_SIZE> = cbstate.unwrap();
+        let client_buffer: &mut SmallLake<DATA_LAKE_SIZE> = cbstate.unwrap();
         if client_buffer.len() != 0 {
             trace!("Some request already processed. Skip.");
             return Ok(());
@@ -453,10 +414,6 @@ impl Server {
         // Extract buffer ID from upper 16 bits of flags. Not suspicious at all.
         let buf_id: u16 = (flags >> 16) as u16;
         let cid: usize = user_data.client_id as usize;
-        // If UBDMA mode is enabled, remember where the kernel is about to... do things.
-        if self.ub_kernel_dma {
-            self.client_kernel_buffer_id.insert(cid, buf_id);
-        }
         // Sanity check: if result > buffer size, something has gone *very* wrong. Likely aliens.
         if result > BUFFER_SIZE as i32 {
             error!("Incorrect packet length > {}", BUFFER_SIZE);
@@ -464,6 +421,11 @@ impl Server {
         }
         // Safely borrow the unholy slab of bytes the kernel just dumped on us.
         let buffer: &[u8] = &self.buffers[buf_id as usize][..result as usize];
+
+        CURRENT_KERNEL_BUF.with(|cell| {
+            cell.set(buffer.as_ptr());
+        });
+
         trace!("New message incoming. Len: {}", buffer.len());
         // Attempt to extract structured requests from the raw chaos.
         let requests: ([RequestEntry; 50], usize) = parse_http_methods_paths(buffer);
@@ -485,7 +447,7 @@ impl Server {
         }
         // Fire the prepared response payload into the client's output buffer.
         let hot_slice: &[u8] = &self.hot_internal_cache[..total_len];
-        let client_buffer: &mut TachyonDataLake<DATA_LAKE_SIZE> =
+        let client_buffer: &mut SmallLake<DATA_LAKE_SIZE> =
             self.client_out_buffers.get_unchecked_mut(cid);
         client_buffer.write(hot_slice.as_ptr(), hot_slice.len());
         // Flag for sync: this shall be pushed soon.
@@ -711,14 +673,24 @@ impl Server {
                 cq.sync();
             }
             // Decide how we wake the kernel — gently or with a slap
-            if self.io_send_busy || (!self.io_send_busy && cq.is_empty()) {
-                // Wait for at least one CQE – because we're lonely
+
+            // if self.io_send_busy || (!self.io_send_busy && cq.is_empty()) {
+            //     // Wait for at least one CQE – because we're lonely
+            //     submitter.submit_and_wait(1)?;
+            //     self.io_send_busy = false;
+            // } else {
+            //     // Fire and forget
+            //     submitter.submit()?;
+            // }
+
+            if cq.is_empty() {
                 submitter.submit_and_wait(1)?;
                 self.io_send_busy = false;
-            } else {
-                // Fire and forget
+            } else if sq.len() >= (sq.capacity() - 4) {
                 submitter.submit()?;
             }
+
+
             self._hz += 1;
             // Process each gift the kernel brings us
             while let Some(cqe) = cq.next() {
@@ -747,14 +719,12 @@ impl Server {
             client_fds: ExternStableVec::new(),
             date: [0u8; 35],
             hot_json_buf: TachyonBuffer::<100>::default(),
-            hot_data_lake: TachyonDataLake::<230>::build(),
+            hot_data_lake: SmallLake::<512>::build(),
             sync_now: true,
-            pointers: VecDeque::new(),
             buffers: [[0u8; BUFFER_SIZE]; BUFFERS_COUNT],
             released_buffers: Vec::with_capacity(BUFFERS_COUNT),
             client_out_buffers: ExternStableVec::with_capacity(u16::MAX as usize),
-            client_kernel_buffer_id: ExternStableVec::with_capacity(u16::MAX as usize),
-            hot_internal_cache: [0u8; BUFFER_SIZE],
+            hot_internal_cache: [0u8; BUFFER_SIZE * 2],
             io_send_busy: false,
             universal_counter: 0,
             nano_clock: unsafe { nano_timestamp() },

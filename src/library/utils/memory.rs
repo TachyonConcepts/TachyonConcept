@@ -47,7 +47,7 @@ pub unsafe fn flatten_iovec(iovecs: &[libc::iovec], out: &mut Vec<u8>) {
 // - AVX2-capable CPU
 // - You know what you’re doing (you probably don’t)
 // - Alignment? Who cares? We're using unaligned stores and hoping for the best.
-#[inline(always)]
+#[target_feature(enable = "avx2")]
 pub unsafe fn avx2_zero(buf: *mut u8, len: usize) {
     let mut ptr = buf;
     let end = buf.add(len);

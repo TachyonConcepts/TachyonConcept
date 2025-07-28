@@ -3,7 +3,7 @@ use std::arch::x86_64::{
     _mm256_setzero_si256,
 };
 
-#[inline(always)]
+#[target_feature(enable = "avx2")]
 pub unsafe fn l_trim256(data: &[u8]) -> &[u8] {
     // AVX2-enhanced left trim.
     // Deletes leading zeros with the finesse of a laser-guided byte scalpel.
@@ -34,7 +34,7 @@ pub unsafe fn l_trim256(data: &[u8]) -> &[u8] {
     &[]
 }
 
-#[inline(always)]
+#[target_feature(enable = "avx2")]
 pub unsafe fn r_trim256(buf: &[u8]) -> &[u8] {
     // AVX2-empowered right trim.
     // Because right-aligned zeroes deserve to be eliminated too.
